@@ -20,6 +20,8 @@ ignore:
   - '*.tar.gz'
   - 'CODEOWNERS'
   - 'NOTICE'
+  - 'reference/*'      # top-level reference/ (e.g. reference/example.py)
+  - '*/reference/*'    # reference/ anywhere else (e.g. sample/reference/example.py)
 
 # Files that should generate warnings instead of errors
 warning:
