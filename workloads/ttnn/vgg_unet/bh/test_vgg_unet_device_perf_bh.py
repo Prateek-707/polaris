@@ -13,10 +13,11 @@ IS_POLARIS = os.getenv('IRD_ARCH_NAME', '') == ''
 from loguru import logger  # noqa: E402
 
 if not IS_POLARIS:
+    import time  # noqa: E402
     import torch  # noqa: E402
     import ttnn  # type: ignore[no-redef, import]  # noqa: E402
-    from models.demos.vision.segmentation.vgg_unet.common.tests.vgg_unet_test_infra import (  # type: ignore[import]  # noqa: E402
-        create_test_infra,
+    from models.demos.vision.segmentation.vgg_unet.common.runner.performant_runner import (  # type: ignore[import]  # noqa: E402
+        VggUnetTrace2CQ,
     )
     from models.perf.device_perf_utils import (  # type: ignore[import]  # noqa: E402
         check_device_perf,
@@ -26,47 +27,54 @@ if not IS_POLARIS:
 else:
     import ttsim.front.ttnn as ttnn  # type: ignore[no-redef]
     import ttsim.front.ttnn.minitorch_shim as torch  # type: ignore[no-redef]
-    from workloads.ttnn.vgg_unet.bh.vgg_unet_test_infra_polaris_bh import create_test_infra  # type: ignore[no-redef]
+    from workloads.ttnn.vgg_unet.bh.vgg_unet_test_infra_polaris_bh import VggUnetTrace2CQ  # type: ignore[no-redef]
 
 
 # ---------------------------------------------------------------------------
-# test_vgg_unet_device_ops — runs the full VGG UNet graph (both modes)
+# run_vgg_unet_e2e — mirrors run_vgg_unet_e2e from test_e2e_performant.py
 # ---------------------------------------------------------------------------
 
-def test_vgg_unet_device_ops(
-    device,
-    batch_size: int = 1,
-):
-    torch.manual_seed(0)
-
-    test_infra = create_test_infra(device, batch_size, use_random_input_tensor=True)
+def run_vgg_unet_e2e(device, device_batch_size: int = 1):
+    vgg_unet_trace_2cq = VggUnetTrace2CQ()
+    vgg_unet_trace_2cq.initialize_vgg_unet_trace_2cqs_inference(
+        device,
+        model_location_generator=None,
+        device_batch_size=device_batch_size,
+    )
 
     if not IS_POLARIS:
-        tt_inputs_host, sharded_mem_config_DRAM, input_mem_config = test_infra.setup_dram_sharded_input(device)
-        tt_image_res = tt_inputs_host.to(device, sharded_mem_config_DRAM)
-        ttnn.copy_host_to_device_tensor(tt_inputs_host, tt_image_res)
-        test_infra.input_tensor = ttnn.to_memory_config(tt_image_res, input_mem_config)
-        output_tensor = test_infra.run()
-        output_tensor = ttnn.to_memory_config(output_tensor, ttnn.DRAM_MEMORY_CONFIG)
+        batch_size = device_batch_size * device.get_num_devices()
+        input_shape = (batch_size, 3, 256, 256)
+        torch_input_tensor = torch.randn(input_shape, dtype=torch.float32)
+        inference_iter_count = 10
+        t0 = time.time()
+        for _ in range(inference_iter_count):
+            output = vgg_unet_trace_2cq.run(torch_input_tensor)
         ttnn.synchronize_device(device)
-    else:
-        tt_inputs_host, sharded_mem_config_DRAM, input_mem_config = test_infra.setup_dram_sharded_input(device)
-        test_infra.input_tensor = ttnn.to_memory_config(tt_inputs_host, input_mem_config)
-        output_tensor = test_infra.run()
-        output_tensor = ttnn.to_memory_config(output_tensor, ttnn.DRAM_MEMORY_CONFIG)
-
-        output = ttnn.to_torch(output_tensor)
-        expected_output_shape = [batch_size, 1, 256, 256]
-        assert output.shape == expected_output_shape, (
-            f'Expected output shape {expected_output_shape}, but got {output.shape}'
+        t1 = time.time()
+        vgg_unet_trace_2cq.release_vgg_unet_trace_2cqs_inference()
+        inference_time_avg = round((t1 - t0) / inference_iter_count, 6)
+        logger.info(
+            f'ttnn_vgg_unet_256x256_batch_size_{batch_size}. '
+            f'One inference iteration time (sec): {inference_time_avg}, '
+            f'FPS: {round(batch_size / inference_time_avg)}'
         )
-        logger.info(f'test_vgg_unet_device_ops: obtained expected output shape {expected_output_shape}')
-        return device
+    else:
+        output = vgg_unet_trace_2cq.run()
+        vgg_unet_trace_2cq.release_vgg_unet_trace_2cqs_inference()
+        output_torch = ttnn.to_torch(output)
+        expected_shape = [device_batch_size, 1, 256, 256]
+        assert output_torch.shape == expected_shape, (
+            f'Expected output shape {expected_shape}, but got {output_torch.shape}'
+        )
+        logger.info(f'run_vgg_unet_e2e: obtained expected output shape {expected_shape}')
+
+    return device
 
 
-def run_vgg_unet_device_ops(wlname: str, device: ttnn.device.Device, cfg: dict):
+def run_vgg_unet_e2e_entry(wlname: str, device: ttnn.device.Device, cfg: dict):
     batch_size = cfg.get('bs', 1)
-    return test_vgg_unet_device_ops(device, batch_size=batch_size)
+    return run_vgg_unet_e2e(device, device_batch_size=batch_size)
 
 
 def run_vgg_unet_perf_device(wlname: str, device: ttnn.device.Device, cfg: dict):
@@ -77,13 +85,13 @@ def run_vgg_unet_perf_device(wlname: str, device: ttnn.device.Device, cfg: dict)
     report via the Polaris analytical path.
     """
     batch_size = cfg.get('bs', 1)
-    test_vgg_unet_device_ops(device, batch_size=batch_size)
+    run_vgg_unet_e2e(device, device_batch_size=batch_size)
     test_vgg_unet_perf_device(batch_size=batch_size)
 
 
 # ---------------------------------------------------------------------------
 # test_vgg_unet_perf_device — dual-mode device profiling
-# HW path: Tracy via subprocess to upstream pytest.
+# HW path: Tracy via subprocess wrapping test_e2e_performant.py.
 # Polaris path: analytical projection via run_device_perf_polaris (BH arch).
 # ---------------------------------------------------------------------------
 
@@ -97,7 +105,7 @@ def test_vgg_unet_perf_device(batch_size: int = 1, expected_kernel_samples_per_s
         )
 
         post_processed_results = run_device_perf_polaris(
-            test_fn=test_vgg_unet_device_ops,
+            test_fn=run_vgg_unet_e2e,
             batch_size=batch_size,
             cols=cols,
             archspec='config/tt_bh.yaml',
@@ -111,8 +119,8 @@ def test_vgg_unet_perf_device(batch_size: int = 1, expected_kernel_samples_per_s
         return
 
     command = (
-        f'pytest models/demos/vision/segmentation/vgg_unet/blackhole/tests/'
-        f'test_vgg_unet_device_perf_bh.py::test_vgg_unet_device_ops[{batch_size}-device_params0]'
+        f'pytest models/demos/vision/segmentation/vgg_unet/blackhole/tests/perf/'
+        f'test_e2e_performant.py::test_vgg_unet_e2e[{batch_size}-device_params0]'
     )
 
     inference_time_key = 'AVG DEVICE KERNEL SAMPLES/S'
@@ -141,7 +149,7 @@ def test_vgg_unet_perf_device(batch_size: int = 1, expected_kernel_samples_per_s
 # ---------------------------------------------------------------------------
 
 _STANDALONE_RUN_SPECS: list[tuple[str, object, str]] = [
-    ('device-ops', run_vgg_unet_device_ops, 'vgg-unet-bh-device-ops'),
+    ('e2e', run_vgg_unet_e2e_entry, 'vgg-unet-bh-e2e'),
 ]
 
 _STANDALONE_VALID_SHORT_NAMES = frozenset(s[0] for s in _STANDALONE_RUN_SPECS)
@@ -159,7 +167,7 @@ def run_one(callback, wlname: str, cfg: dict):
 
 
 def standalone(test_name: str | None = None) -> None:
-    """Run standalone BH device-perf VGG UNet tests, or a single test by short name."""
+    """Run standalone BH e2e VGG UNet tests, or a single test by short name."""
     all_names = _STANDALONE_VALID_SHORT_NAMES | {'device-perf'}
 
     if test_name == 'device-perf':
@@ -184,16 +192,16 @@ if __name__ == '__main__':
     logger.remove()
     logger.add(sys.stdout, level='INFO')
     parser = argparse.ArgumentParser(
-        description='Run VGG UNet (Blackhole) device-perf standalone tests.'
+        description='Run VGG UNet (Blackhole) e2e standalone tests.'
     )
     parser.add_argument(
         'test',
         nargs='?',
         metavar='TEST',
-        default='device-ops',
+        default='e2e',
         help=(
             'Run only this test by short name, '
-            'e.g. device-ops, device-perf. If omitted, runs device-ops.'
+            'e.g. e2e, device-perf. If omitted, runs e2e.'
         ),
     )
     _args = parser.parse_args()

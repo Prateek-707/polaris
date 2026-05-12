@@ -93,3 +93,28 @@ def create_test_infra(
         use_random_input_tensor,
         model_location_generator=model_location_generator,
     )
+
+
+class VggUnetTrace2CQ:
+    """Polaris stub matching the interface of ``VggUnetTrace2CQ`` from
+    ``common/runner/performant_runner.py``.
+
+    On polaris there is no 2CQ / trace — initialize just builds the model and
+    prepares the input; run executes one forward pass.
+    """
+
+    def initialize_vgg_unet_trace_2cqs_inference(
+        self, device, model_location_generator=None, device_batch_size=1
+    ):
+        self._infra = create_test_infra(
+            device, device_batch_size, model_location_generator=model_location_generator
+        )
+        tt_inputs_host, _, input_mem_config = self._infra.setup_dram_sharded_input(device)
+        self._infra.input_tensor = ttnn.to_memory_config(tt_inputs_host, input_mem_config)
+
+    def run(self, torch_input_tensor=None):
+        self._infra.run()
+        return self._infra.output_tensor
+
+    def release_vgg_unet_trace_2cqs_inference(self):
+        pass
