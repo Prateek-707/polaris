@@ -161,7 +161,7 @@ def run_one(callback, wlname: str, cfg: dict):
         device = open_device()
     else:
         from ttnn import close_device, open_device  # type: ignore[no-redef]
-        device = open_device(device_id=0)
+        device = open_device(device_id=0, l1_small_size=32768, trace_region_size=6434816, num_command_queues=2)
     callback(wlname, device, cfg)
     close_device(device)
 
