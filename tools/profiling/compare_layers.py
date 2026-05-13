@@ -156,6 +156,7 @@ class ComparisonStats:
     unmatched_polaris: int = 0
     unmatched_profiler: int = 0
     ambiguous: int = 0
+    lut_key_mismatches: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -221,6 +222,16 @@ def parse_args() -> argparse.Namespace:
              'one table per file. With --perf, adds summed duration (and Polaris LUT '
              'hits when available), and the profiler-vs-Polaris performance comparison '
              'is grouped by type+signature instead of by optype alone.',
+    )
+    parser.add_argument(
+        '--by-lut-key',
+        action='store_true',
+        help='Print a rollup table grouped by full LUT key (optype + per-input-slot '
+             'padded shape, layout, dtype, memory + math_fidelity), with columns '
+             'exploded. Requires profiler CSV input (polaris CSVs carry no lut_key). '
+             'With one file, prints a single-file count table. With two files, prints '
+             'a side-by-side count table. With --perf, adds summed duration columns '
+             'and absolute/percent gap.',
     )
     parser.add_argument(
         '--xlsx',
@@ -463,6 +474,15 @@ def compare_layers(
                     stats.output_shape_mismatches += 1
                 stats.shape_mismatches += 1
 
+            # LUT key comparison (for all matched pairs, both profiler outputs)
+            lk1 = l1.get('lut_key')
+            lk2 = l2.get('lut_key')
+            if lk1 is not None and lk2 is not None and lk1 != lk2:
+                print(f"  lut_key mismatch [1:{l1['seqno']}] [2:{l2['seqno']}] {l1['optype']}")
+                print(f"    {label1}: {lk1}")
+                print(f"    {label2}: {lk2}")
+                stats.lut_key_mismatches += 1
+
             ndx1 += 1
             ndx2 += 1
             continue
@@ -595,6 +615,7 @@ def print_summary(stats: ComparisonStats, label1: str = 'File1', label2: str = '
     print(f"Shape mismatches: {stats.shape_mismatches} "
           f"({stats.input_shape_mismatches} input, {stats.output_shape_mismatches} output)")
     print(f"Attribute mismatches: {stats.attr_mismatches}")
+    print(f"LUT key mismatches: {stats.lut_key_mismatches}")
     print(f"Unmatched entries: {stats.unmatched_polaris + stats.unmatched_profiler} "
           f"({stats.unmatched_polaris} {label1}, {stats.unmatched_profiler} {label2})")
     print(f"Ambiguous: {stats.ambiguous}")
@@ -932,6 +953,270 @@ def _print_perf_comparison(
 
 
 # ---------------------------------------------------------------------------
+# LUT key summary helpers
+# ---------------------------------------------------------------------------
+
+_LUT_SLOT_NAMES: Tuple[str, ...] = ('w', 'z', 'y', 'x', 'layout', 'dtype', 'memory')
+
+
+def _lut_key_n_slots(key: Tuple[str, ...]) -> int:
+    """Number of input slots encoded in a lut_key tuple."""
+    return max(0, (len(key) - 2) // 7)
+
+
+def _lut_key_slot_field(key: Tuple[str, ...], slot: int, field_idx: int) -> str:
+    """Return the string value for (slot, field_idx) in a lut_key, or '' if out of range."""
+    idx = 1 + slot * 7 + field_idx
+    return str(key[idx]) if idx < len(key) - 1 else ''
+
+
+def _aggregate_by_lut_key(
+    layers: List[Dict[str, Any]],
+) -> Dict[Tuple[str, ...], Tuple[int, float, int]]:
+    """Group layers by lut_key; return {key: (count, total_ms, lut_hits)}."""
+    counts: DefaultDict[Tuple[str, ...], int] = defaultdict(int)
+    ms_totals: DefaultDict[Tuple[str, ...], float] = defaultdict(float)
+    lut_totals: DefaultDict[Tuple[str, ...], int] = defaultdict(int)
+    for layer in layers:
+        raw = layer.get('lut_key')
+        if raw is None:
+            continue
+        key: Tuple[str, ...] = tuple(str(f) for f in raw)
+        counts[key] += 1
+        d = layer.get('duration_ms')
+        if d is not None:
+            ms_totals[key] += float(d)
+        if layer.get('uses_perf_lookup'):
+            lut_totals[key] += 1
+    return {k: (counts[k], ms_totals.get(k, 0.0), lut_totals.get(k, 0)) for k in counts}
+
+
+def _lut_key_col_widths(
+    keys: List[Tuple[str, ...]], max_slots: int
+) -> Tuple[int, int, List[List[int]]]:
+    """Return (col_op, col_mf, slot_widths) computed from data."""
+    col_op = max(10, max((len(k[0]) for k in keys), default=10))
+    col_mf = max(4, max((len(k[-1]) for k in keys), default=4))
+    slot_widths: List[List[int]] = []
+    for s in range(max_slots):
+        widths = []
+        for fi, name in enumerate(_LUT_SLOT_NAMES):
+            suffix = f'_{s}' if s > 0 else ''
+            hdr_w = len(name + suffix)
+            data_w = max((_lut_key_slot_field(k, s, fi).__len__() for k in keys), default=0)
+            widths.append(max(hdr_w, data_w, 4))
+        slot_widths.append(widths)
+    return col_op, col_mf, slot_widths
+
+
+def _lut_key_row(
+    key: Tuple[str, ...],
+    col_op: int,
+    col_mf: int,
+    slot_widths: List[List[int]],
+    prefix: str = '  ',
+) -> str:
+    """Format the optype + per-slot + mf portion of a LUT key row."""
+    line = f'{prefix}{str(key[0]):<{col_op}}'
+    for s, widths in enumerate(slot_widths):
+        for fi in range(len(_LUT_SLOT_NAMES)):
+            v = _lut_key_slot_field(key, s, fi)
+            line += f'  {v:<{widths[fi]}}'
+    line += f'  {str(key[-1]):<{col_mf}}'
+    return line
+
+
+def _lut_key_header(
+    col_op: int,
+    col_mf: int,
+    slot_widths: List[List[int]],
+    prefix: str = '  ',
+) -> str:
+    """Format the column header for the LUT key columns."""
+    hdr = f'{prefix}{"Layer type":<{col_op}}'
+    for s, widths in enumerate(slot_widths):
+        for fi, name in enumerate(_LUT_SLOT_NAMES):
+            suffix = f'_{s}' if s > 0 else ''
+            hdr += f'  {(name + suffix):<{widths[fi]}}'
+    hdr += f'  {"MF":<{col_mf}}'
+    return hdr
+
+
+def _print_lut_key_summary(
+    layers: List[Dict[str, Any]],
+    label: str,
+    *,
+    include_perf: bool,
+) -> None:
+    """Rollup: count (and optionally ms/LUT) per unique LUT key, columns exploded."""
+    by_key = _aggregate_by_lut_key(layers)
+    if not by_key:
+        print(f'\n(No lut_key data for {label} — profiler CSV required)')
+        return
+
+    keys_sorted: List[Tuple[str, ...]] = sorted(
+        by_key.keys(),
+        key=lambda k: (-by_key[k][1] if include_perf else -by_key[k][0], str(k)),
+    )
+    max_slots = max((_lut_key_n_slots(k) for k in keys_sorted), default=0)
+    has_lut = include_perf and any(by_key[k][2] > 0 for k in keys_sorted)
+    col_op, col_mf, slot_widths = _lut_key_col_widths(keys_sorted, max_slots)
+    col_c = 6
+    col_m = 12
+    col_l = 9
+
+    hdr_key = _lut_key_header(col_op, col_mf, slot_widths)
+    hdr = f'  {"Count":>{col_c}}{hdr_key[1:]}'
+    if include_perf:
+        hdr += f'  {"Sum ms":>{col_m}}'
+        if has_lut:
+            hdr += f'  {"LUT":>{col_l}}'
+    rule = '─' * max(len(hdr) - 2, 72)
+
+    print(f'\n{"=" * max(len(hdr), 72)}')
+    print(f'  Summary by LUT key ({label})')
+    print(f'{"=" * max(len(hdr), 72)}')
+    print(hdr)
+    print(f'  {rule}')
+
+    total_n = 0
+    total_ms = 0.0
+    total_lut = 0
+    for key in keys_sorted:
+        n, ms, lut = by_key[key]
+        total_n += n
+        total_ms += ms
+        total_lut += lut
+        line = f'  {n:>{col_c}}{_lut_key_row(key, col_op, col_mf, slot_widths)[1:]}'
+        if include_perf:
+            line += f'  {ms:>{col_m}.4f}'
+            if has_lut:
+                line += f'  {f"{lut}/{n}":>{col_l}}'
+        print(line)
+
+    print(f'  {rule}')
+    total_line = f'  {total_n:>{col_c}}  {"TOTAL":<{col_op}}'
+    for widths in slot_widths:
+        for w in widths:
+            total_line += f'  {"":>{w}}'
+    total_line += f'  {"":>{col_mf}}'
+    if include_perf:
+        total_line += f'  {total_ms:>{col_m}.4f}'
+        if has_lut:
+            total_line += f'  {f"{total_lut}/{total_n}":>{col_l}}'
+    print(total_line)
+    print()
+
+
+def _print_lut_key_comparison(
+    layers1: List[Dict[str, Any]],
+    layers2: List[Dict[str, Any]],
+    *,
+    label1: str,
+    label2: str,
+    include_perf: bool,
+) -> None:
+    """Side-by-side LUT key comparison: count (and optionally ms/gap) per unique key."""
+    by1 = _aggregate_by_lut_key(layers1)
+    by2 = _aggregate_by_lut_key(layers2)
+
+    if not by1 and not by2:
+        print('\n(No lut_key data in either file — profiler CSV required)')
+        return
+    if not by1:
+        print(f'\n(No lut_key data for {label1})')
+    if not by2:
+        print(f'\n(No lut_key data for {label2})')
+
+    all_keys: List[Tuple[str, ...]] = list(dict.fromkeys(list(by1.keys()) + list(by2.keys())))
+    if include_perf:
+        all_keys.sort(
+            key=lambda k: max(by1.get(k, (0, 0.0, 0))[1], by2.get(k, (0, 0.0, 0))[1]),
+            reverse=True,
+        )
+    else:
+        all_keys.sort(
+            key=lambda k: -(by1.get(k, (0, 0, 0))[0] + by2.get(k, (0, 0, 0))[0]),
+        )
+
+    max_slots = max((_lut_key_n_slots(k) for k in all_keys), default=0)
+    col_op, col_mf, slot_widths = _lut_key_col_widths(all_keys, max_slots)
+    total_ms1 = sum(ms for _, ms, _ in by1.values())
+    total_ms2 = sum(ms for _, ms, _ in by2.values())
+    total_cnt1 = sum(cnt for cnt, _, _ in by1.values())
+    total_cnt2 = sum(cnt for cnt, _, _ in by2.values())
+    total_lut1 = sum(lut for _, _, lut in by1.values())
+    total_lut2 = sum(lut for _, _, lut in by2.values())
+    has_lut = (total_lut1 + total_lut2) > 0
+
+    lbl1 = label1[:10]
+    lbl2 = label2[:10]
+    col_cnt = 7
+    col_ms = max(13, len(f'{lbl1}(ms)'), len(f'{lbl2}(ms)'))
+
+    hdr_key = _lut_key_header(col_op, col_mf, slot_widths)
+    hdr = hdr_key
+    hdr += f'  {"#1":>{col_cnt}}'
+    if include_perf:
+        hdr += f'  {f"{lbl1}(ms)":>{col_ms}}'
+    hdr += f'  {"#2":>{col_cnt}}'
+    if include_perf:
+        hdr += f'  {f"{lbl2}(ms)":>{col_ms}}  {"AbsGap(ms)":>12}  {"Gap%":>9}'
+    rule = '─' * max(len(hdr) - 2, 82)
+
+    title_w = max(len(hdr), 82)
+    print(f'\n{"=" * title_w}')
+    print(f'  LUT key comparison: {label1} vs {label2}')
+    print(f'{"=" * title_w}')
+
+    if include_perf:
+        print('\n  Network total:')
+        print(f'    {label1}:  {total_ms1:.4f} ms')
+        print(f'    {label2}:  {total_ms2:.4f} ms')
+        print(f'    Gap:  {_pct_gap(total_ms1, total_ms2)} (w.r.t. {label1})')
+        if has_lut:
+            print(f'    {label1} LUT hits: {total_lut1}/{total_cnt1}')
+            print(f'    {label2} LUT hits: {total_lut2}/{total_cnt2}')
+        print()
+
+    print(hdr)
+    print(f'  {rule}')
+
+    for key in all_keys:
+        cnt1, ms1, lut1 = by1.get(key, (0, 0.0, 0))
+        cnt2, ms2, lut2 = by2.get(key, (0, 0.0, 0))
+        line = _lut_key_row(key, col_op, col_mf, slot_widths)
+        cnt1_s = str(cnt1) if cnt1 else '—'
+        cnt2_s = str(cnt2) if cnt2 else '—'
+        line += f'  {cnt1_s:>{col_cnt}}'
+        if include_perf:
+            ms1_s = f'{ms1:.4f}' if cnt1 else '—'
+            line += f'  {ms1_s:>{col_ms}}'
+        line += f'  {cnt2_s:>{col_cnt}}'
+        if include_perf:
+            ms2_s = f'{ms2:.4f}' if cnt2 else '—'
+            abs_gap_s = f'{ms2 - ms1:+.4f}' if (cnt1 and cnt2) else '—'
+            line += f'  {ms2_s:>{col_ms}}  {abs_gap_s:>12}  {_pct_gap(ms1, ms2):>9}'
+        print(line)
+
+    print(f'  {rule}')
+    total_line = f'  {"TOTAL":<{col_op}}'
+    for widths in slot_widths:
+        for w in widths:
+            total_line += f'  {"":>{w}}'
+    total_line += f'  {"":>{col_mf}}'
+    total_line += f'  {total_cnt1:>{col_cnt}}'
+    if include_perf:
+        total_line += f'  {total_ms1:>{col_ms}.4f}'
+    total_line += f'  {total_cnt2:>{col_cnt}}'
+    if include_perf:
+        abs_total = total_ms2 - total_ms1
+        total_line += f'  {total_ms2:>{col_ms}.4f}  {abs_total:>+12.4f}  {_pct_gap(total_ms1, total_ms2):>9}'
+    print(total_line)
+    print()
+
+
+# ---------------------------------------------------------------------------
 # XLSX report (three sheets: Summary, By Layer Type, By Layer Signature)
 # ---------------------------------------------------------------------------
 
@@ -1119,6 +1404,7 @@ def _write_xlsx_report(
             ("  input shape mismatches", stats.input_shape_mismatches),
             ("  output shape mismatches", stats.output_shape_mismatches),
             ("Attribute mismatches", stats.attr_mismatches),
+            ("LUT key mismatches", stats.lut_key_mismatches),
             (f"Unmatched ({label1})", stats.unmatched_polaris),
             (f"Unmatched ({label2})", stats.unmatched_profiler),
             ("Ambiguous", stats.ambiguous),
@@ -1367,11 +1653,11 @@ def main() -> int:
             print(f"Error: {e}", file=sys.stderr)
             return 1
 
-    # --- Standalone mode (single file + --perf and/or --summarize-by-signature) ---
+    # --- Standalone mode (single file + --perf / --summarize-by-signature / --by-lut-key) ---
     if file2_path is None:
-        if not args.perf and not args.summarize_by_signature:
+        if not args.perf and not args.summarize_by_signature and not args.by_lut_key:
             print("Error: Two files are required for shape comparison. "
-                  "Use --perf and/or --summarize-by-signature with a single file.",
+                  "Use --perf, --summarize-by-signature, or --by-lut-key with a single file.",
                   file=sys.stderr)
             return 1
 
@@ -1409,6 +1695,8 @@ def main() -> int:
                 args.strip_singleton_dims,
                 include_perf=args.perf,
             )
+        if args.by_lut_key:
+            _print_lut_key_summary(layers, label, include_perf=args.perf)
         if args.perf:
             if args.summarize_by_signature:
                 _print_perf_standalone_by_signature(
@@ -1417,7 +1705,7 @@ def main() -> int:
                     args.strip_leading_ones,
                     args.strip_singleton_dims,
                 )
-            else:
+            elif not args.by_lut_key:
                 _print_perf_standalone(layers, label)
 
         if args.xlsx:
@@ -1520,6 +1808,15 @@ def main() -> int:
             label2,
             args.strip_leading_ones,
             args.strip_singleton_dims,
+            include_perf=args.perf,
+        )
+
+    if args.by_lut_key:
+        _print_lut_key_comparison(
+            layers1,
+            layers2,
+            label1=label1,
+            label2=label2,
             include_perf=args.perf,
         )
 
