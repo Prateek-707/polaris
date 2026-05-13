@@ -73,6 +73,11 @@ PROFILER_PREFIX_RULES: tuple[tuple[str, str], ...] = (
     ("Reshard", "reshard"),
     ("ShardedToInterleaved", "shardedtointerleaved"),
     ("InterleavedToSharded", "interleavedtosharded"),
+    ("Conv2d", "conv2d"),
+    ("Pool2D", "pool2d"),
+    ("Halo", "halo"),
+    ("Move", "move"),
+    ("Pad", "pad"),
 )
 
 # BinaryOpType::ENUM (uppercase) → canonical layer type.
