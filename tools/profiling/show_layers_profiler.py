@@ -62,6 +62,31 @@ def expand_tensor_attrs(row: Dict[str, Any], input_index: int, in_or_out: str = 
     return {'layout': layout, 'dtype': dtype, 'memory': memory}
 
 
+def _build_lut_key(
+    optype: str,
+    pad_logical_slots: List[List[tuple]],
+    layouts: List[Optional[str]],
+    dtypes: List[Optional[str]],
+    memories: List[Optional[str]],
+    math_fidelity: str,
+) -> tuple:
+    """Build a LUT key tuple matching tt_perf_master_schema KEY_TUPLE_YAML_KEYS convention.
+
+    Each input slot contributes 7 elements: w_pad, z_pad, y_pad, x_pad, layout, dtype, memory.
+    Dimensions are zero-padded to 4 (W, Z, Y, X); missing slots use empty strings.
+    """
+    key: list = [optype]
+    for slot_idx, dims in enumerate(pad_logical_slots):
+        pad_vals = [str(p) for p, _ in dims]
+        pad_vals.extend([''] * (4 - len(pad_vals)))
+        key.extend(pad_vals[:4])
+        key.append(layouts[slot_idx] or '')
+        key.append(dtypes[slot_idx] or '')
+        key.append(memories[slot_idx] or '')
+    key.append(math_fidelity)
+    return tuple(key)
+
+
 def layers_profiler(input_file: str) -> List[Dict[str, Any]]:
     rows = []
     with open(input_file, 'r') as f:
@@ -77,6 +102,8 @@ def layers_profiler(input_file: str) -> List[Dict[str, Any]]:
             if not isinstance(parsed_attrs, dict):
                 parsed_attrs = None
             optype = normalize_profiler_opcode(row['OP CODE'], parsed_attrs)
+            math_fidelity_raw = (row.get('MATH FIDELITY') or '').strip()
+            math_fidelity = math_fidelity_raw if math_fidelity_raw else 'N/A'
             # Attribute lists (dtypes, layouts, memories) must stay parallel
             # with their tensor lists so that positional indexing in
             # compare_tensor_attributes (compare_layers.py) compares the
@@ -128,6 +155,14 @@ def layers_profiler(input_file: str) -> List[Dict[str, Any]]:
                     filtered_row['output_dtypes'].append(a['dtype'] if a else None)
                     filtered_row['output_layouts'].append(a['layout'] if a else None)
                     filtered_row['output_memories'].append(a['memory'] if a else None)
+            filtered_row['lut_key'] = _build_lut_key(
+                optype,
+                filtered_row['input_pad_logical'],
+                filtered_row['input_layouts'],
+                filtered_row['input_dtypes'],
+                filtered_row['input_memories'],
+                math_fidelity,
+            )
             rows.append(filtered_row)
 
     # Post-process: correct ops where the profiler conflates PAD and LOGICAL
