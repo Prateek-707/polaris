@@ -811,15 +811,39 @@ split = multiple_output_immediate_op("Split", preprocess=split_pp)
 layer_norm = single_output_immediate_op("LayerNormalization", preprocess=layer_norm_pp)
 batch_norm = single_output_immediate_op("BatchNormalization")
 
-# Convolution
-conv2d = single_output_immediate_op("Conv", preprocess=conv2d_pp)
-conv_transpose2d = single_output_immediate_op(
-    "ConvTranspose", preprocess=conv_transpose2d_pp
-)
+# Halo: auto-emitted by the shim before every conv2d / pool2d / conv_transpose2d,
+# mirroring the hardware dispatch where halo extraction is implicit inside those ops.
+halo = single_output_immediate_op("Halo")
 
-# Pooling
+
+def _with_halo(op_fn):
+    """Return a wrapper that auto-emits a Halo SimOp before the main op.
+
+    Halo is skipped for 1×1 kernels: hardware implements those as matmul
+    and never dispatches a halo extraction step.
+    """
+    def _impl(*args, **kwargs):
+        ks = kwargs.get('kernel_size', (3, 3))
+        if tuple(ks) != (1, 1):
+            if 'input_tensor' in kwargs:
+                kwargs['input_tensor'] = halo(kwargs['input_tensor'])
+            elif args:
+                args = (halo(args[0]),) + args[1:]
+        return op_fn(*args, **kwargs)
+    return _impl
+
+
+# Convolution (Halo auto-emitted before each call, matching hardware sub-op sequence)
+_conv2d_raw = single_output_immediate_op("Conv", preprocess=conv2d_pp)
+conv2d = _with_halo(_conv2d_raw)
+
+_conv_transpose2d_raw = single_output_immediate_op("ConvTranspose", preprocess=conv_transpose2d_pp)
+conv_transpose2d = _with_halo(_conv_transpose2d_raw)
+
+# Pooling (Halo auto-emitted before max_pool2d, matching hardware sub-op sequence)
 global_avg_pool2d = single_output_immediate_op("GlobalAveragePool")
-max_pool2d = single_output_immediate_op("MaxPool", preprocess=max_pool2d_pp)
+_max_pool2d_raw = single_output_immediate_op("MaxPool", preprocess=max_pool2d_pp)
+max_pool2d = _with_halo(_max_pool2d_raw)
 
 # Matrix Multiplication
 matmul = single_output_immediate_op("MatMul")

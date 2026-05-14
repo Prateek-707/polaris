@@ -49,6 +49,7 @@ op_rsrc_spec:
              Equal, Erf, Exp, Expand,
              Flatten, Fold,
              Gather, GatherND, Gelu, GlobalAveragePool, GridSample, Greater, GroupNormalization,
+             Halo,
              HardSigmoid, Hardswish,
              Identity, If, InterleavedToSharded, IsNaN,
              LayerNormalization, LeakyRelu, Log, Less,

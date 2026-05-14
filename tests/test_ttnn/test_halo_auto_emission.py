@@ -1,0 +1,230 @@
+#!/usr/bin/env python
+# SPDX-FileCopyrightText: (C) 2025 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests that Halo SimOps are auto-emitted before conv2d / max_pool2d / conv_transpose2d.
+
+On Tenstorrent hardware, halo extraction is dispatched implicitly by the conv and
+pool kernels.  The ttnn shim mirrors this by auto-emitting a Halo SimOp before each
+Conv / MaxPool / ConvTranspose SimOp so that profiler-vs-Polaris sequence matching
+finds a corresponding entry for every hardware halo row.
+"""
+
+import pytest
+import numpy as np
+
+import ttsim.front.ttnn as ttnn
+from ttsim.front.ttnn.device import ARCH, Device
+from ttsim.front.ttnn.tensor import DataType, Layout, Tensor
+
+
+def _make_device():
+    device = Device(device_id=0)
+    device.architecture = ARCH.WORMHOLE_B0
+    return device
+
+
+def _make_tensor(name, shape, device):
+    return Tensor(
+        name=name,
+        shape=shape,
+        dtype=DataType.BFLOAT16,
+        layout=Layout.ROW_MAJOR_LAYOUT,
+        device=device,
+    )
+
+
+def _op_sequence(device):
+    """Return list of (optype, op) in insertion order."""
+    return [(op.optype, op) for op in device.ops.values()]
+
+
+# ---------------------------------------------------------------------------
+# conv2d: should emit Halo → Conv
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_conv2d_emits_halo_then_conv():
+    device = _make_device()
+    x = _make_tensor("x", [1, 3, 8, 8], device)
+    w = _make_tensor("w", [4, 3, 3, 3], device)
+    b = _make_tensor("b", [4], device)
+
+    out = ttnn.conv2d(
+        input_tensor=x,
+        weight_tensor=w,
+        bias_tensor=b,
+        in_channels=3,
+        out_channels=4,
+        batch_size=1,
+        input_height=8,
+        input_width=8,
+        kernel_size=(3, 3),
+        stride=(1, 1),
+        padding=(1, 1),
+        dilation=(1, 1),
+        groups=1,
+        device=device,
+    )
+
+    seq = _op_sequence(device)
+    assert len(seq) == 2, f"Expected 2 ops (Halo+Conv), got {[s[0] for s in seq]}"
+    assert seq[0][0] == "Halo"
+    assert seq[1][0] == "Conv"
+
+    # Halo output shape == input shape (passthrough)
+    halo_op = seq[0][1]
+    assert halo_op.inList == [x.name]
+    halo_out_name = halo_op.outList[0]
+
+    # Conv input is the halo output
+    conv_op = seq[1][1]
+    assert halo_out_name in conv_op.inList
+
+    # Final output shape correct
+    assert out.shape == [1, 4, 8, 8]
+
+
+@pytest.mark.unit
+def test_conv2d_halo_shape_passthrough():
+    device = _make_device()
+    shape = [1, 16, 32, 32]
+    x = _make_tensor("x", shape, device)
+    w = _make_tensor("w", [32, 16, 3, 3], device)
+    b = _make_tensor("b", [32], device)
+
+    ttnn.conv2d(
+        input_tensor=x, weight_tensor=w, bias_tensor=b,
+        in_channels=16, out_channels=32, batch_size=1,
+        input_height=32, input_width=32,
+        kernel_size=(3, 3), stride=(1, 1), padding=(1, 1),
+        dilation=(1, 1), groups=1, device=device,
+    )
+
+    halo_op = _op_sequence(device)[0][1]
+    # Halo perf_stats reflects input shape
+    assert halo_op.perf_stats["inElems"] == 1 * 16 * 32 * 32
+    assert halo_op.perf_stats["outElems"] == 1 * 16 * 32 * 32
+
+
+# ---------------------------------------------------------------------------
+# max_pool2d: should emit Halo → MaxPool
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_max_pool2d_emits_halo_then_pool():
+    device = _make_device()
+    x = _make_tensor("x", [1, 64, 16, 16], device)
+
+    ttnn.max_pool2d(
+        input_tensor=x,
+        batch_size=1,
+        input_h=16,
+        input_w=16,
+        channels=64,
+        kernel_size=[2, 2],
+        stride=[2, 2],
+        padding=[0, 0],
+        dilation=[1, 1],
+    )
+
+    seq = _op_sequence(device)
+    assert len(seq) == 2, f"Expected 2 ops (Halo+MaxPool), got {[s[0] for s in seq]}"
+    assert seq[0][0] == "Halo"
+    assert seq[1][0] == "MaxPool"
+
+    halo_out_name = seq[0][1].outList[0]
+    assert halo_out_name in seq[1][1].inList
+
+
+# ---------------------------------------------------------------------------
+# conv_transpose2d: should emit Halo → ConvTranspose
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_conv_transpose2d_emits_halo_then_convtranspose():
+    device = _make_device()
+    x = _make_tensor("x", [1, 16, 8, 8], device)
+    w = _make_tensor("w", [16, 8, 2, 2], device)
+    b = _make_tensor("b", [8], device)
+
+    ttnn.conv_transpose2d(
+        input_tensor=x,
+        weight_tensor=w,
+        bias_tensor=b,
+        in_channels=16,
+        out_channels=8,
+        batch_size=1,
+        input_height=8,
+        input_width=8,
+        kernel_size=(2, 2),
+        stride=(2, 2),
+        padding=(0, 0),
+        dilation=(1, 1),
+        groups=1,
+        device=device,
+        output_padding=(0, 0),
+    )
+
+    seq = _op_sequence(device)
+    assert len(seq) == 2, f"Expected 2 ops (Halo+ConvTranspose), got {[s[0] for s in seq]}"
+    assert seq[0][0] == "Halo"
+    assert seq[1][0] == "ConvTranspose"
+
+    halo_out_name = seq[0][1].outList[0]
+    assert halo_out_name in seq[1][1].inList
+
+
+# ---------------------------------------------------------------------------
+# Multiple ops on same device: each call adds its own Halo
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_multiple_conv2d_each_get_own_halo():
+    device = _make_device()
+
+    for i in range(3):
+        x = _make_tensor(f"x{i}", [1, 8, 4, 4], device)
+        w = _make_tensor(f"w{i}", [8, 8, 3, 3], device)
+        b = _make_tensor(f"b{i}", [8], device)
+        ttnn.conv2d(
+            input_tensor=x, weight_tensor=w, bias_tensor=b,
+            in_channels=8, out_channels=8, batch_size=1,
+            input_height=4, input_width=4,
+            kernel_size=(3, 3), stride=(1, 1), padding=(1, 1),
+            dilation=(1, 1), groups=1, device=device,
+        )
+
+    seq = _op_sequence(device)
+    halo_count = sum(1 for optype, _ in seq if optype == "Halo")
+    conv_count = sum(1 for optype, _ in seq if optype == "Conv")
+    assert halo_count == 3
+    assert conv_count == 3
+    # Order: Halo, Conv, Halo, Conv, Halo, Conv
+    for i in range(3):
+        assert seq[i * 2][0] == "Halo"
+        assert seq[i * 2 + 1][0] == "Conv"
+
+
+# ---------------------------------------------------------------------------
+# 1×1 conv: hardware uses matmul, so no Halo should be emitted
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_conv2d_1x1_no_halo():
+    device = _make_device()
+    x = _make_tensor("x", [1, 64, 256, 256], device)
+    w = _make_tensor("w", [1, 64, 1, 1], device)
+    b = _make_tensor("b", [1], device)
+
+    ttnn.conv2d(
+        input_tensor=x, weight_tensor=w, bias_tensor=b,
+        in_channels=64, out_channels=1, batch_size=1,
+        input_height=256, input_width=256,
+        kernel_size=(1, 1), stride=(1, 1), padding=(0, 0),
+        dilation=(1, 1), groups=1, device=device,
+    )
+
+    seq = _op_sequence(device)
+    assert len(seq) == 1, f"Expected 1 op (Conv only, no Halo for 1×1), got {[s[0] for s in seq]}"
+    assert seq[0][0] == "Conv"
