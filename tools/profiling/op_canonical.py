@@ -126,6 +126,8 @@ _RE_UNARY_OP_TYPE = re.compile(
     r"UnaryOpType::(\w+)",
     re.IGNORECASE,
 )
+# SlidingWindowConfig embeds is_transpose=true for conv_transpose2d on hardware.
+_RE_CONV_IS_TRANSPOSE = re.compile(r'is_transpose\s*=\s*true', re.IGNORECASE)
 
 _UNKNOWN_PROFILER_BASES: set[str] = set()
 
@@ -153,6 +155,11 @@ COMPARISON_GROUPS: Dict[str, str] = {
     "sub": "binary",
     "eltwise": "binary",
     "tilizewithvalpadding": "tilize",
+    # Polaris abstract names → profiler hardware names
+    # conv_transpose2d has no separate OP CODE on hardware; implemented as Conv2dDeviceOperation
+    "conv": "conv2d",
+    "maxpool": "pool2d",
+    "convtranspose": "conv2d",
 }
 
 # ---------------------------------------------------------------------------
@@ -268,6 +275,21 @@ def _resolve_unary_attrs(attrs: Any) -> Optional[str]:
     return None
 
 
+def _resolve_conv_subtype(attrs: Any) -> str:
+    """Return 'convtranspose' when attrs contain is_transpose=true, else 'conv2d'.
+
+    Conv2dDeviceOperation on hardware implements both regular and transposed
+    convolutions.  The SlidingWindowConfig embedded in ATTRIBUTES carries an
+    explicit ``is_transpose`` flag that distinguishes the two variants.
+    """
+    if attrs is None:
+        return 'conv2d'
+    raw_str = str(attrs)
+    if _RE_CONV_IS_TRANSPOSE.search(raw_str):
+        return 'convtranspose'
+    return 'conv2d'
+
+
 def normalize_profiler_opcode(opcode: Any, attrs: Any = None) -> str:
     """Map a profiler OP CODE cell (+ optional ATTRIBUTES) to a canonical
     lowercase Polaris layer type.
@@ -331,6 +353,10 @@ def normalize_profiler_opcode(opcode: Any, attrs: Any = None) -> str:
             s,
         )
         return _apply_prefix_rules(base)
+
+    # Conv2d: distinguish regular conv from transposed conv via is_transpose flag
+    if base == "Conv2d":
+        return _resolve_conv_subtype(attrs)
 
     return _apply_prefix_rules(base)
 
