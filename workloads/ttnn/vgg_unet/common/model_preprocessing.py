@@ -530,7 +530,7 @@ def create_vgg_unet_model_parameters(device):  # noqa: C901 (complexity)
     parameters.conv_args.d1.conv_block.conv2['shard_layout'] = None
     parameters.conv_args.d1.conv_block.conv2['activation'] = 'relu'
     parameters.conv_args.d1.conv_block.conv2['padding'] = (1, 1)
-    parameters.conv_args.d1.conv_block.conv2['do_sharded_to_interleaved'] = True
+    parameters.conv_args.d1.conv_block.conv2['do_sharded_to_interleaved'] = False
     parameters.conv_args.d1.conv_block.conv2.in_channels = 512
     parameters.conv_args.d1.conv_block.conv2.out_channels = 512
     parameters.conv_args.d1.conv_block.conv2.batch_size = 1
@@ -608,7 +608,7 @@ def create_vgg_unet_model_parameters(device):  # noqa: C901 (complexity)
     parameters.conv_args.d3.conv_block.conv1['shard_layout'] = None
     parameters.conv_args.d3.conv_block.conv1['activation'] = 'relu'
     parameters.conv_args.d3.conv_block.conv1['padding'] = (1, 1)
-    parameters.conv_args.d3.conv_block.conv1['do_sharded_to_interleaved'] = True
+    parameters.conv_args.d3.conv_block.conv1['do_sharded_to_interleaved'] = False
     parameters.conv_args.d3.conv_block.conv1.in_channels = 256
     parameters.conv_args.d3.conv_block.conv1.out_channels = 128
     parameters.conv_args.d3.conv_block.conv1.batch_size = 1
@@ -622,7 +622,7 @@ def create_vgg_unet_model_parameters(device):  # noqa: C901 (complexity)
     parameters.conv_args.d3.conv_block.conv2['shard_layout'] = None
     parameters.conv_args.d3.conv_block.conv2['activation'] = 'relu'
     parameters.conv_args.d3.conv_block.conv2['padding'] = (1, 1)
-    parameters.conv_args.d3.conv_block.conv2['do_sharded_to_interleaved'] = True
+    parameters.conv_args.d3.conv_block.conv2['do_sharded_to_interleaved'] = False
     parameters.conv_args.d3.conv_block.conv2.in_channels = 128
     parameters.conv_args.d3.conv_block.conv2.out_channels = 128
     parameters.conv_args.d3.conv_block.conv2.batch_size = 1
@@ -654,7 +654,7 @@ def create_vgg_unet_model_parameters(device):  # noqa: C901 (complexity)
     parameters.conv_args.d4.conv_block.conv1['shard_layout'] = None
     parameters.conv_args.d4.conv_block.conv1['activation'] = 'relu'
     parameters.conv_args.d4.conv_block.conv1['padding'] = (1, 1)
-    parameters.conv_args.d4.conv_block.conv1['do_sharded_to_interleaved'] = True
+    parameters.conv_args.d4.conv_block.conv1['do_sharded_to_interleaved'] = False
     parameters.conv_args.d4.conv_block.conv1.in_channels = 128
     parameters.conv_args.d4.conv_block.conv1.out_channels = 64
     parameters.conv_args.d4.conv_block.conv1.batch_size = 1
@@ -668,7 +668,7 @@ def create_vgg_unet_model_parameters(device):  # noqa: C901 (complexity)
     parameters.conv_args.d4.conv_block.conv2['shard_layout'] = None
     parameters.conv_args.d4.conv_block.conv2['activation'] = 'relu'
     parameters.conv_args.d4.conv_block.conv2['padding'] = (1, 1)
-    parameters.conv_args.d4.conv_block.conv2['do_sharded_to_interleaved'] = True
+    parameters.conv_args.d4.conv_block.conv2['do_sharded_to_interleaved'] = False
     parameters.conv_args.d4.conv_block.conv2.in_channels = 64
     parameters.conv_args.d4.conv_block.conv2.out_channels = 64
     parameters.conv_args.d4.conv_block.conv2.batch_size = 1

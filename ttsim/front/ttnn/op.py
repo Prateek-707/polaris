@@ -815,16 +815,36 @@ batch_norm = single_output_immediate_op("BatchNormalization")
 # mirroring the hardware dispatch where halo extraction is implicit inside those ops.
 halo = single_output_immediate_op("Halo")
 
+# InterleavedToSharded: auto-emitted when conv/pool receives an interleaved tensor,
+# mirroring the hardware dispatch where the kernel internally converts to sharded
+# before halo extraction.
+_interleaved_to_sharded = single_output_immediate_op("InterleavedToSharded")
+
 
 def _with_halo(op_fn):
     """Return a wrapper that auto-emits a Halo SimOp before the main op.
 
     Halo is skipped for 1×1 kernels: hardware implements those as matmul
     and never dispatches a halo extraction step.
+
+    When the input has an interleaved memory config, an InterleavedToSharded
+    SimOp is emitted first, matching the hardware dispatch where conv/pool
+    kernels internally convert interleaved activations to sharded layout
+    before halo extraction.
     """
     def _impl(*args, **kwargs):
         ks = kwargs.get('kernel_size', (3, 3))
         if tuple(ks) != (1, 1):
+            input_tensor = kwargs.get('input_tensor') or (args[0] if args else None)
+            if input_tensor is not None:
+                mc = getattr(input_tensor, '_memory_config', None)
+                if mc is not None and not mc.is_sharded():
+                    its_out = _interleaved_to_sharded(input_tensor)
+                    its_out._memory_config = MemoryConfig(TensorMemoryLayout.HEIGHT_SHARDED, BufferType.L1)
+                    if 'input_tensor' in kwargs:
+                        kwargs['input_tensor'] = its_out
+                    else:
+                        args = (its_out,) + args[1:]
             if 'input_tensor' in kwargs:
                 kwargs['input_tensor'] = halo(kwargs['input_tensor'])
             elif args:

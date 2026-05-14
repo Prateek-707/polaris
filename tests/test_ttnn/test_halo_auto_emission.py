@@ -16,6 +16,8 @@ import numpy as np
 import ttsim.front.ttnn as ttnn
 from ttsim.front.ttnn.device import ARCH, Device
 from ttsim.front.ttnn.tensor import DataType, Layout, Tensor
+from ttsim.front.ttnn.memory import MemoryConfig
+from ttsim.front.ttnn.buffer import TensorMemoryLayout, BufferType
 
 
 def _make_device():
@@ -228,3 +230,126 @@ def test_conv2d_1x1_no_halo():
     seq = _op_sequence(device)
     assert len(seq) == 1, f"Expected 1 op (Conv only, no Halo for 1×1), got {[s[0] for s in seq]}"
     assert seq[0][0] == "Conv"
+
+
+# ---------------------------------------------------------------------------
+# InterleavedToSharded auto-emission: interleaved input → ITS → Halo → Conv
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_conv2d_interleaved_input_emits_its_then_halo():
+    device = _make_device()
+    x = _make_tensor("x", [1, 64, 16, 16], device)
+    x._memory_config = MemoryConfig(TensorMemoryLayout.INTERLEAVED, BufferType.L1)
+    w = _make_tensor("w", [128, 64, 3, 3], device)
+    b = _make_tensor("b", [128], device)
+
+    ttnn.conv2d(
+        input_tensor=x, weight_tensor=w, bias_tensor=b,
+        in_channels=64, out_channels=128, batch_size=1,
+        input_height=16, input_width=16,
+        kernel_size=(3, 3), stride=(1, 1), padding=(1, 1),
+        dilation=(1, 1), groups=1, device=device,
+    )
+
+    seq = _op_sequence(device)
+    assert len(seq) == 3, f"Expected ITS+Halo+Conv, got {[s[0] for s in seq]}"
+    assert seq[0][0] == "InterleavedToSharded"
+    assert seq[1][0] == "Halo"
+    assert seq[2][0] == "Conv"
+
+    its_out_name = seq[0][1].outList[0]
+    assert its_out_name in seq[1][1].inList
+
+
+@pytest.mark.unit
+def test_conv2d_sharded_input_no_its():
+    """Sharded input should only emit Halo → Conv, no ITS."""
+    device = _make_device()
+    x = _make_tensor("x", [1, 64, 16, 16], device)
+    x._memory_config = MemoryConfig(TensorMemoryLayout.HEIGHT_SHARDED, BufferType.L1)
+    w = _make_tensor("w", [128, 64, 3, 3], device)
+    b = _make_tensor("b", [128], device)
+
+    ttnn.conv2d(
+        input_tensor=x, weight_tensor=w, bias_tensor=b,
+        in_channels=64, out_channels=128, batch_size=1,
+        input_height=16, input_width=16,
+        kernel_size=(3, 3), stride=(1, 1), padding=(1, 1),
+        dilation=(1, 1), groups=1, device=device,
+    )
+
+    seq = _op_sequence(device)
+    assert len(seq) == 2, f"Expected Halo+Conv only (sharded input), got {[s[0] for s in seq]}"
+    assert seq[0][0] == "Halo"
+    assert seq[1][0] == "Conv"
+
+
+@pytest.mark.unit
+def test_conv2d_no_memory_config_no_its():
+    """Tensor with no _memory_config should only emit Halo → Conv."""
+    device = _make_device()
+    x = _make_tensor("x", [1, 64, 16, 16], device)
+    # no _memory_config set
+    w = _make_tensor("w", [128, 64, 3, 3], device)
+    b = _make_tensor("b", [128], device)
+
+    ttnn.conv2d(
+        input_tensor=x, weight_tensor=w, bias_tensor=b,
+        in_channels=64, out_channels=128, batch_size=1,
+        input_height=16, input_width=16,
+        kernel_size=(3, 3), stride=(1, 1), padding=(1, 1),
+        dilation=(1, 1), groups=1, device=device,
+    )
+
+    seq = _op_sequence(device)
+    assert len(seq) == 2, f"Expected Halo+Conv only (no _mc), got {[s[0] for s in seq]}"
+    assert seq[0][0] == "Halo"
+    assert seq[1][0] == "Conv"
+
+
+# ---------------------------------------------------------------------------
+# to_memory_config: sharded→different-sharded emits STI+ITS
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_to_memory_config_sharded_to_different_sharded_emits_sti_its():
+    device = _make_device()
+    x = _make_tensor("x", [1, 64, 32, 32], device)
+    x._memory_config = MemoryConfig(TensorMemoryLayout.BLOCK_SHARDED, BufferType.L1)
+
+    target_mc = MemoryConfig(TensorMemoryLayout.HEIGHT_SHARDED, BufferType.L1)
+    ttnn.to_memory_config(x, target_mc)
+
+    seq = _op_sequence(device)
+    assert len(seq) == 2, f"Expected STI+ITS, got {[s[0] for s in seq]}"
+    assert seq[0][0] == "ShardedToInterleaved"
+    assert seq[1][0] == "InterleavedToSharded"
+
+
+@pytest.mark.unit
+def test_to_memory_config_same_sharded_no_ops():
+    """Same sharded config → no STI+ITS emitted."""
+    device = _make_device()
+    x = _make_tensor("x", [1, 64, 32, 32], device)
+    mc = MemoryConfig(TensorMemoryLayout.HEIGHT_SHARDED, BufferType.L1)
+    x._memory_config = mc
+
+    ttnn.to_memory_config(x, mc)
+
+    seq = _op_sequence(device)
+    assert len(seq) == 0, f"Expected no ops for same config, got {[s[0] for s in seq]}"
+
+
+@pytest.mark.unit
+def test_to_memory_config_interleaved_to_sharded_no_sti():
+    """Interleaved→sharded via to_memory_config: no STI (only ITS would come later via _with_halo)."""
+    device = _make_device()
+    x = _make_tensor("x", [1, 64, 32, 32], device)
+    x._memory_config = MemoryConfig(TensorMemoryLayout.INTERLEAVED, BufferType.L1)
+
+    target_mc = MemoryConfig(TensorMemoryLayout.HEIGHT_SHARDED, BufferType.L1)
+    ttnn.to_memory_config(x, target_mc)
+
+    seq = _op_sequence(device)
+    assert len(seq) == 0, f"Expected no ops (interleaved→sharded not a reshard), got {[s[0] for s in seq]}"
