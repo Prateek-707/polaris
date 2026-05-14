@@ -257,6 +257,13 @@ class Tt_vgg_unet:
         # [1, 1, N*H*W, C] format — those hardware-specific ops are skipped here
         # because conv_sinf expects NCHW and the polaris shim returns a single
         # Tensor from conv2d (not the unpacked [out, dims, weights] tuple).
+        #
+        # TODO(428): emit the three ops that appear in HW ttnn_vgg_unet.py lines 250-255
+        #   ttnn.pad(input, ((0,0),(0,channel_padding_needed),(0,0),(0,0)), value=0.0)  — pads C=3 → 16
+        #   ttnn.permute(x, (0, 2, 3, 1))                                              — NCHW → NHWC
+        #   ttnn.reshape(x, (1, 1, N*H*W, 16))                                         — flatten spatial
+        # These are inside the metal trace and show up as Pad + Permute + Reshape in
+        # the profiler CSV.  Deferred pending a decision on NCHW vs NHWC shim design.
         x = input
 
         x = self.s1_0(x)

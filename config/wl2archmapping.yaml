@@ -52,6 +52,7 @@ op_rsrc_spec:
              Halo,
              HardSigmoid, Hardswish,
              Identity, If, InterleavedToSharded, IsNaN,
+             Move,
              LayerNormalization, LeakyRelu, Log, Less,
              Max, MaxPool, Mean, Min, Mish, Mul,
              Neg, ConcatHeads, CreateQKVHeads, NonMaxSuppression, NonZero, # transformer head ops from ttnn_shim

@@ -820,6 +820,12 @@ halo = single_output_immediate_op("Halo")
 # before halo extraction.
 _interleaved_to_sharded = single_output_immediate_op("InterleavedToSharded")
 
+# Move: auto-emitted after conv2d / conv_transpose2d when deallocate_activation=True.
+# On hardware, MoveDeviceOperation copies the output buffer to a new memory region
+# to free the old one.  The shim mirrors this by emitting a Move SimOp after the
+# conv output, matching the hardware profiler op sequence.
+_move = single_output_immediate_op("Move")
+
 
 def _with_halo(op_fn):
     """Return a wrapper that auto-emits a Halo SimOp before the main op.
@@ -853,12 +859,59 @@ def _with_halo(op_fn):
     return _impl
 
 
-# Convolution (Halo auto-emitted before each call, matching hardware sub-op sequence)
+def _with_move(op_fn):
+    """Return a wrapper that auto-emits a Move SimOp after the main op.
+
+    Move is emitted only when two conditions both hold:
+      1. deallocate_activation=True (direct kwarg or via Conv2dConfig.conv_config)
+      2. The input tensor's _memory_config is L1-sharded (HEIGHT or BLOCK sharded
+         on L1 buffer).
+
+    Condition 2 mirrors hardware: MoveDeviceOperation is only dispatched when the
+    activation lives in L1 sharded memory.  Tensors in DRAM or interleaved L1 are
+    left in place and no Move is emitted.
+    """
+    def _impl(*args, **kwargs):
+        # Capture input tensor BEFORE op_fn runs (conv_config/halo may transform it).
+        input_tensor = kwargs.get('input_tensor') or (args[0] if args else None)
+
+        conv_cfg = kwargs.get('conv_config')
+        deallocate = kwargs.get(
+            'deallocate_activation',
+            getattr(conv_cfg, 'deallocate_activation', False),
+        )
+        result = op_fn(*args, **kwargs)
+        if deallocate:
+            mc = getattr(input_tensor, '_memory_config', None)
+            is_l1_sharded = (
+                mc is not None
+                and mc.is_sharded()
+                and getattr(mc, 'buffer_type', None) == BufferType.L1
+            )
+            if is_l1_sharded:
+                result = _move(result)
+        return result
+    return _impl
+
+
+# Convolution (ITS→Halo auto-emitted before, Move auto-emitted after when deallocate_activation=True)
 _conv2d_raw = single_output_immediate_op("Conv", preprocess=conv2d_pp)
-conv2d = _with_halo(_conv2d_raw)
+# 1×1 conv: hardware lowers to MatMul; use same conv2d_pp attrs so matmul_shape_inf
+# detects kernel_shape=[1,1] and applies NCHW conv output-shape logic.
+_matmul_1x1_raw = single_output_immediate_op("MatMul", preprocess=conv2d_pp)
+
+
+def _conv2d_dispatch(*args, **kwargs):
+    ks = kwargs.get('kernel_size', (3, 3))
+    if tuple(ks) == (1, 1):
+        return _matmul_1x1_raw(*args, **kwargs)
+    return _conv2d_raw(*args, **kwargs)
+
+
+conv2d = _with_move(_with_halo(_conv2d_dispatch))
 
 _conv_transpose2d_raw = single_output_immediate_op("ConvTranspose", preprocess=conv_transpose2d_pp)
-conv_transpose2d = _with_halo(_conv_transpose2d_raw)
+conv_transpose2d = _with_move(_with_halo(_conv_transpose2d_raw))
 
 # Pooling (Halo auto-emitted before max_pool2d, matching hardware sub-op sequence)
 global_avg_pool2d = single_output_immediate_op("GlobalAveragePool")

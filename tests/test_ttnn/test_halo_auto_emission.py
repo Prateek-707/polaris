@@ -228,8 +228,48 @@ def test_conv2d_1x1_no_halo():
     )
 
     seq = _op_sequence(device)
-    assert len(seq) == 1, f"Expected 1 op (Conv only, no Halo for 1×1), got {[s[0] for s in seq]}"
-    assert seq[0][0] == "Conv"
+    assert len(seq) == 1, f"Expected 1 op (MatMul only, no Halo for 1×1), got {[s[0] for s in seq]}"
+    assert seq[0][0] == "MatMul"
+
+
+@pytest.mark.unit
+def test_conv2d_1x1_matmul_shape_passthrough():
+    """1×1 conv emits MatMul with correct NCHW output shape [N, C_out, H, W]."""
+    device = _make_device()
+    x = _make_tensor('x', [1, 64, 32, 32], device)
+    w = _make_tensor('w', [128, 64, 1, 1], device)
+    b = _make_tensor('b', [128], device)
+
+    out = ttnn.conv2d(
+        input_tensor=x, weight_tensor=w, bias_tensor=b,
+        in_channels=64, out_channels=128, batch_size=1,
+        input_height=32, input_width=32,
+        kernel_size=(1, 1), stride=(1, 1), padding=(0, 0),
+        dilation=(1, 1), groups=1, device=device,
+    )
+
+    seq = _op_sequence(device)
+    assert seq[0][0] == 'MatMul'
+    assert list(out.shape) == [1, 128, 32, 32]
+
+
+@pytest.mark.unit
+def test_conv2d_1x1_stride2_matmul_shape():
+    """1×1 conv with stride=2 emits MatMul with halved spatial dims."""
+    device = _make_device()
+    x = _make_tensor('x', [1, 64, 32, 32], device)
+    w = _make_tensor('w', [128, 64, 1, 1], device)
+    b = _make_tensor('b', [128], device)
+
+    out = ttnn.conv2d(
+        input_tensor=x, weight_tensor=w, bias_tensor=b,
+        in_channels=64, out_channels=128, batch_size=1,
+        input_height=32, input_width=32,
+        kernel_size=(1, 1), stride=(2, 2), padding=(0, 0),
+        dilation=(1, 1), groups=1, device=device,
+    )
+
+    assert list(out.shape) == [1, 128, 16, 16]
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +346,176 @@ def test_conv2d_no_memory_config_no_its():
     assert len(seq) == 2, f"Expected Halo+Conv only (no _mc), got {[s[0] for s in seq]}"
     assert seq[0][0] == "Halo"
     assert seq[1][0] == "Conv"
+
+
+# ---------------------------------------------------------------------------
+# Move auto-emission: requires deallocate_activation=True AND L1-sharded input
+# ---------------------------------------------------------------------------
+
+def _make_l1_sharded_tensor(name, shape, device, layout=TensorMemoryLayout.HEIGHT_SHARDED):
+    """Helper: tensor with L1 sharded _memory_config so _with_move fires."""
+    t = _make_tensor(name, shape, device)
+    t._memory_config = MemoryConfig(layout, BufferType.L1)
+    return t
+
+
+@pytest.mark.unit
+def test_conv2d_deallocate_l1sharded_emits_move():
+    """deallocate_activation=True + L1-sharded input → Halo+Conv+Move."""
+    device = _make_device()
+    x = _make_l1_sharded_tensor('x', [1, 8, 4, 4], device)
+    w = _make_tensor('w', [8, 8, 3, 3], device)
+    b = _make_tensor('b', [8], device)
+
+    out = ttnn.conv2d(
+        input_tensor=x, weight_tensor=w, bias_tensor=b,
+        in_channels=8, out_channels=8, batch_size=1,
+        input_height=4, input_width=4,
+        kernel_size=(3, 3), stride=(1, 1), padding=(1, 1),
+        dilation=(1, 1), groups=1, device=device,
+        deallocate_activation=True,
+    )
+
+    seq = _op_sequence(device)
+    assert len(seq) == 3, f'Expected Halo+Conv+Move, got {[s[0] for s in seq]}'
+    assert seq[0][0] == 'Halo'
+    assert seq[1][0] == 'Conv'
+    assert seq[2][0] == 'Move'
+    conv_out_name = seq[1][1].outList[0]
+    assert conv_out_name in seq[2][1].inList
+    assert out.name == seq[2][1].outList[0]
+
+
+@pytest.mark.unit
+def test_conv2d_deallocate_no_memory_config_no_move():
+    """deallocate_activation=True but no _memory_config → no Move (DRAM default)."""
+    device = _make_device()
+    x = _make_tensor('x', [1, 8, 4, 4], device)   # no _memory_config set
+    w = _make_tensor('w', [8, 8, 3, 3], device)
+    b = _make_tensor('b', [8], device)
+
+    ttnn.conv2d(
+        input_tensor=x, weight_tensor=w, bias_tensor=b,
+        in_channels=8, out_channels=8, batch_size=1,
+        input_height=4, input_width=4,
+        kernel_size=(3, 3), stride=(1, 1), padding=(1, 1),
+        dilation=(1, 1), groups=1, device=device,
+        deallocate_activation=True,
+    )
+
+    seq = _op_sequence(device)
+    assert len(seq) == 2, f'Expected Halo+Conv only (no mc), got {[s[0] for s in seq]}'
+    assert seq[0][0] == 'Halo'
+    assert seq[1][0] == 'Conv'
+
+
+@pytest.mark.unit
+def test_conv2d_deallocate_interleaved_l1_no_move():
+    """deallocate_activation=True but interleaved L1 → no Move."""
+    device = _make_device()
+    x = _make_tensor('x', [1, 8, 4, 4], device)
+    x._memory_config = MemoryConfig(TensorMemoryLayout.INTERLEAVED, BufferType.L1)
+    w = _make_tensor('w', [8, 8, 3, 3], device)
+    b = _make_tensor('b', [8], device)
+
+    ttnn.conv2d(
+        input_tensor=x, weight_tensor=w, bias_tensor=b,
+        in_channels=8, out_channels=8, batch_size=1,
+        input_height=4, input_width=4,
+        kernel_size=(3, 3), stride=(1, 1), padding=(1, 1),
+        dilation=(1, 1), groups=1, device=device,
+        deallocate_activation=True,
+    )
+
+    seq = _op_sequence(device)
+    # Interleaved → _with_halo emits ITS before Halo, but still no Move
+    optypes = [s[0] for s in seq]
+    assert 'Move' not in optypes, f'Move should not be emitted for interleaved L1: {optypes}'
+
+
+@pytest.mark.unit
+def test_conv2d_no_deallocate_no_move():
+    """deallocate_activation=False → no Move regardless of memory config."""
+    device = _make_device()
+    x = _make_l1_sharded_tensor('x', [1, 8, 4, 4], device)
+    w = _make_tensor('w', [8, 8, 3, 3], device)
+    b = _make_tensor('b', [8], device)
+
+    ttnn.conv2d(
+        input_tensor=x, weight_tensor=w, bias_tensor=b,
+        in_channels=8, out_channels=8, batch_size=1,
+        input_height=4, input_width=4,
+        kernel_size=(3, 3), stride=(1, 1), padding=(1, 1),
+        dilation=(1, 1), groups=1, device=device,
+        deallocate_activation=False,
+    )
+
+    seq = _op_sequence(device)
+    assert all(s[0] != 'Move' for s in seq), f'Unexpected Move with deallocate=False: {[s[0] for s in seq]}'
+
+
+@pytest.mark.unit
+def test_conv2d_move_shape_passthrough():
+    """Move output shape must equal Conv output shape."""
+    device = _make_device()
+    x = _make_l1_sharded_tensor('x', [1, 8, 8, 8], device)
+    w = _make_tensor('w', [16, 8, 3, 3], device)
+    b = _make_tensor('b', [16], device)
+
+    out = ttnn.conv2d(
+        input_tensor=x, weight_tensor=w, bias_tensor=b,
+        in_channels=8, out_channels=16, batch_size=1,
+        input_height=8, input_width=8,
+        kernel_size=(3, 3), stride=(1, 1), padding=(1, 1),
+        dilation=(1, 1), groups=1, device=device,
+        deallocate_activation=True,
+    )
+
+    assert out.shape == [1, 16, 8, 8]
+
+
+@pytest.mark.unit
+def test_conv2d_1x1_deallocate_l1sharded_emits_move_no_halo():
+    """1×1 conv, deallocate=True, L1-sharded input: Conv+Move, no Halo."""
+    device = _make_device()
+    x = _make_l1_sharded_tensor('x', [1, 64, 16, 16], device)
+    w = _make_tensor('w', [32, 64, 1, 1], device)
+    b = _make_tensor('b', [32], device)
+
+    ttnn.conv2d(
+        input_tensor=x, weight_tensor=w, bias_tensor=b,
+        in_channels=64, out_channels=32, batch_size=1,
+        input_height=16, input_width=16,
+        kernel_size=(1, 1), stride=(1, 1), padding=(0, 0),
+        dilation=(1, 1), groups=1, device=device,
+        deallocate_activation=True,
+    )
+
+    seq = _op_sequence(device)
+    assert len(seq) == 2, f'Expected MatMul+Move only (no Halo for 1×1), got {[s[0] for s in seq]}'
+    assert seq[0][0] == 'MatMul'
+    assert seq[1][0] == 'Move'
+
+
+@pytest.mark.unit
+def test_conv2d_block_sharded_deallocate_emits_move():
+    """BLOCK_SHARDED L1 input with deallocate=True also triggers Move."""
+    device = _make_device()
+    x = _make_l1_sharded_tensor('x', [1, 16, 8, 8], device, TensorMemoryLayout.BLOCK_SHARDED)
+    w = _make_tensor('w', [16, 16, 3, 3], device)
+    b = _make_tensor('b', [16], device)
+
+    ttnn.conv2d(
+        input_tensor=x, weight_tensor=w, bias_tensor=b,
+        in_channels=16, out_channels=16, batch_size=1,
+        input_height=8, input_width=8,
+        kernel_size=(3, 3), stride=(1, 1), padding=(1, 1),
+        dilation=(1, 1), groups=1, device=device,
+        deallocate_activation=True,
+    )
+
+    seq = _op_sequence(device)
+    assert seq[-1][0] == 'Move', f'Expected Move at end, got {[s[0] for s in seq]}'
 
 
 # ---------------------------------------------------------------------------

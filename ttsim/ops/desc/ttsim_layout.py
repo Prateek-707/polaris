@@ -376,6 +376,34 @@ def halo_sinf(iTList, oTList, op, **kwargs):
     return
 
 
+def move_sinf(iTList, oTList, op, **kwargs):
+    """Shape inference for Move: logical shape passthrough.
+
+    MoveDeviceOperation copies the activation buffer to a new memory region
+    (triggered by deallocate_activation=True in conv args).  The logical
+    tensor shape and dtype are unchanged; cost is two memory transfers.
+    """
+    assert len(iTList) == 1 and len(oTList) == 1
+    X = iTList[0]
+    in_shape = require_shape_list(
+        X.shape,
+        'Move shape inference: input tensor shape must be known',
+    )
+    oTList[0].shape = list(in_shape)
+    oTList[0].dtype = X.dtype
+
+    elem_size = op.attrs.get('element_size', 2)
+    elems = _nelems(in_shape)
+    op.perf_stats = {
+        'inElems': elems,
+        'outElems': elems,
+        'inBytes': elems * elem_size,
+        'outBytes': elems * elem_size,
+        'instrs': {'mov': elems},
+    }
+    return
+
+
 def register_layout_ops():
     d = _TTNN_OP_DOMAIN
     _optbl = [
@@ -387,6 +415,7 @@ def register_layout_ops():
         ['ShardedToInterleaved', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, sharded_to_interleaved_sinf, True, True, True, True, True],
         ['Reshard', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, reshard_sinf, True, True, True, True, True],
         ['Halo', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, halo_sinf, True, True, True, True, True],
+        ['Move', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, move_sinf, True, True, True, True, True],
         ['ConcatHeads', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, nlp_concat_heads_sinf, True, True, True, True, True],
         ['CreateQKVHeads', 'ARITY_VARIADIC[1-2]->3', d, 'COMMON', 24, 21, 2, 1, 3, 3, nlp_create_qkv_heads_sinf, True, True, True, True, True],
     ]

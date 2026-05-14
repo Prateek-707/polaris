@@ -578,6 +578,28 @@ def matmul_shape_inf(iTList, oTList, op, **kwargs):
     from ttsim.ops.desc.helpers import bidirectional_broadcast_shape_inference
     from .data_compute import compute_matmul
 
+    # 1×1 conv lowered to MatMul: conv2d_pp injects kernel_shape=[1,1] into attrs.
+    # Apply NCHW conv shape inference so downstream ops see [N, C_out, H_out, W_out].
+    if op.attrs.get('kernel_shape') == [1, 1]:
+        assert iTList[0].check_shape(), 'MatMul(1×1-conv): input shape undefined'
+        assert iTList[1].check_shape(), 'MatMul(1×1-conv): weight shape undefined'
+        N, C_in, H_in, W_in = iTList[0].shape
+        C_out = iTList[1].shape[0]
+        strides = op.attrs.get('strides', [1, 1])
+        H_out, W_out = H_in // strides[0], W_in // strides[1]
+        oTList[0].shape = [N, C_out, H_out, W_out]
+        oTList[0].dtype = iTList[0].dtype
+        oTList[0].data = None
+        in_elems = sum(t.nelems() for t in iTList)
+        in_bytes = sum(t.nbytes(op.precision) for t in iTList)
+        out_elems = oTList[0].nelems()
+        op.perf_stats = {
+            'inElems': in_elems, 'outElems': out_elems,
+            'inBytes': in_bytes, 'outBytes': oTList[0].nbytes(op.precision),
+            'instrs': {'mac': out_elems * C_in},
+        }
+        return
+
     A, B = iTList[0], iTList[1]
     assert A.check_shape(), f"Input tensor-A shape not defined: {A}"
     assert B.check_shape(), f"Input tensor-B shape not defined: {B}"
